@@ -209,24 +209,41 @@ def linear_fetch_projects(api_key: str, team_id: str) -> list:
     return data["team"]["projects"]["nodes"]
 
 
-# Issue fields — base (always available)
-_FIELDS_BASE = """
+# Main paginated query fields — scalars and single-object fields ONLY.
+# Nested collections (comments, attachments, relations) are intentionally excluded
+# to stay within Linear's query complexity budget.  They are fetched in the
+# separate enrichment step (linear_enrich_with_history).
+_FIELDS_FULL = """
     id identifier title description priority priorityLabel
-    estimate dueDate slaStartedAt slaDueAt completedAt canceledAt archivedAt createdAt updatedAt
+    estimate dueDate createdAt updatedAt completedAt canceledAt archivedAt
     url branchName
     state        { id name type color }
     assignee     { id name email displayName }
     creator      { id name email displayName }
-    labels       { nodes { id name color } }
+    labels(first: 10) { nodes { id name color } }
     project      { id name state description url }
-    issueType    { id name }
     team         { id name key }
     parent       { id identifier title }
-    children     { nodes { id identifier title state { name type } } }
-    attachments  { nodes { id title subtitle url metadata createdAt creator { name email } } }
-    comments     { nodes { id body createdAt updatedAt user { id name email displayName } } }
-    relations    { nodes { id type relatedIssue { id identifier title state { name } } } }
 """
+
+# Safe fallback — identical to _FIELDS_FULL (kept for structural consistency).
+_FIELDS_SAFE = """
+    id identifier title description priority priorityLabel
+    estimate dueDate createdAt updatedAt completedAt canceledAt archivedAt
+    url branchName
+    state        { id name type color }
+    assignee     { id name email displayName }
+    creator      { id name email displayName }
+    labels(first: 10) { nodes { id name color } }
+    project      { id name state description url }
+    team         { id name key }
+    parent       { id identifier title }
+"""
+
+# Fields fetched per-issue in the enrichment batch (history, comments, attachments, relations)
+_ENRICH_COMMENT_FIELDS    = "id body createdAt updatedAt user { id name email displayName }"
+_ENRICH_ATTACHMENT_FIELDS = "id title url createdAt creator { name email }"
+_ENRICH_RELATION_FIELDS   = "id type relatedIssue { id identifier title state { name } }"
 
 # History fields fetched separately (too expensive to inline with issue list query)
 _HISTORY_NODE_FIELDS = (
@@ -242,20 +259,17 @@ _HISTORY_NODE_FIELDS = (
 )
 
 
-def _build_issue_query(since_str: Optional[str] = None) -> str:
-    if since_str:
-        issues_args = (
-            'filter: { createdAt: { gte: "' + since_str + '" } }, '
-            'first: 25, after: $cursor, orderBy: createdAt'
-        )
-    else:
-        issues_args = "first: 25, after: $cursor, orderBy: createdAt"
+def _build_issue_query(since_str: Optional[str] = None, fields: str = _FIELDS_FULL) -> str:
+    filter_clause = (
+        f'filter: {{ updatedAt: {{ gte: "{since_str}" }} }}, ' if since_str else ""
+    )
+    issues_args = f"{filter_clause}first: 50, after: $cursor, orderBy: createdAt"
     return (
         "query($teamId: String!, $cursor: String) {"
         "  team(id: $teamId) {"
         "    issues(" + issues_args + ") {"
         "      pageInfo { hasNextPage endCursor }"
-        "      nodes {" + _FIELDS_BASE + "}"
+        "      nodes {" + fields + "}"
         "    }"
         "  }"
         "}"
@@ -267,13 +281,14 @@ def _paginate_issues(api_key: str, team_id: str, query: str) -> list:
     cursor: Optional[str] = None
     page = 1
     while True:
-        print(f"    Page {page} ({len(issues)} issues collected)…")
-        variables: dict = {"teamId": team_id}
-        if cursor:
-            variables["cursor"] = cursor
+        print(f"    Page {page} ({len(issues)} so far)…")
+        # Always pass cursor explicitly — passing null is unambiguous for the server
+        variables: dict = {"teamId": team_id, "cursor": cursor}
         data = gql(api_key, query, variables)
         result = data["team"]["issues"]
-        issues.extend(result["nodes"])
+        batch = result["nodes"]
+        issues.extend(batch)
+        print(f"    → {len(batch)} issue(s) returned this page  (total: {len(issues)})")
         if not result["pageInfo"]["hasNextPage"]:
             break
         cursor = result["pageInfo"]["endCursor"]
@@ -281,50 +296,134 @@ def _paginate_issues(api_key: str, team_id: str, query: str) -> list:
     return issues
 
 
+def linear_probe_issues(api_key: str, team_id: str) -> int:
+    """
+    Minimal query — fetch just id/identifier/title for up to 5 issues.
+    Returns the count (0-5), or -1 if there are more than 5.
+    Used to verify the team has accessible issues before running the full query.
+    """
+    data = gql(api_key,
+        "query($t: String!) {"
+        "  team(id: $t) {"
+        "    issues(first: 5, orderBy: createdAt) {"
+        "      nodes { id identifier title }"
+        "      pageInfo { hasNextPage }"
+        "    }"
+        "  }"
+        "}",
+        {"t": team_id})
+    result = data["team"]["issues"]
+    if result["pageInfo"]["hasNextPage"]:
+        return -1  # more than 5
+    return len(result["nodes"])
+
+
 def linear_fetch_all_issues(api_key: str, team_id: str,
                              since_date: Optional[datetime] = None) -> list:
-    """Fetch issues using only base fields (history is enriched separately)."""
+    """
+    Fetch all issues for a team with as many fields as the API supports.
+
+    Tries _FIELDS_FULL first; if Linear rejects a field, retries with _FIELDS_SAFE.
+    """
     since_str = since_date.strftime("%Y-%m-%dT%H:%M:%S.000Z") if since_date else None
-    query = _build_issue_query(since_str)
-    return _paginate_issues(api_key, team_id, query)
+
+    try:
+        return _paginate_issues(api_key, team_id, _build_issue_query(since_str, _FIELDS_FULL))
+    except Exception as exc:
+        print(f"    Note: full field query failed — {str(exc)[:200]}")
+        print("    Retrying with safe field set…")
+
+    return _paginate_issues(api_key, team_id, _build_issue_query(since_str, _FIELDS_SAFE))
+
+
+def linear_fetch_project_issues(api_key: str, project_id: str) -> list:
+    """
+    Fetch all issues belonging to a Linear project via the project endpoint.
+    This catches issues that may not appear under team.issues in some workspaces.
+    """
+    def _run(fields: str) -> list:
+        issues: list = []
+        cursor: Optional[str] = None
+        template = (
+            "query($pid: String!, $cursor: String) {"
+            "  project(id: $pid) {"
+            "    issues(first: 50, after: $cursor, orderBy: createdAt) {"
+            "      pageInfo { hasNextPage endCursor }"
+            "      nodes {" + fields + "}"
+            "    }"
+            "  }"
+            "}"
+        )
+        while True:
+            data = gql(api_key, template, {"pid": project_id, "cursor": cursor})
+            result = data["project"]["issues"]
+            issues.extend(result["nodes"])
+            if not result["pageInfo"]["hasNextPage"]:
+                break
+            cursor = result["pageInfo"]["endCursor"]
+        return issues
+
+    try:
+        return _run(_FIELDS_FULL)
+    except Exception as exc:
+        print(f"      Note: full field query failed for project ({str(exc)[:100]}), retrying…")
+    return _run(_FIELDS_SAFE)
 
 
 def linear_enrich_with_history(api_key: str, issues: list,
                                 batch_size: int = 8) -> None:
     """
-    Fetch issue history in batches (using GraphQL aliases) and merge into
-    each issue dict in-place.  Silently skips if the API doesn't support it.
+    Fetch issue history, comments, attachments, and relations in batches
+    (using GraphQL aliases) and merge into each issue dict in-place.
+    Silently skips any sub-query that the API rejects.
     """
     if not issues:
         return
-    print(f"    Enriching {len(issues)} issue(s) with history…")
+    print(f"    Enriching {len(issues)} issue(s) with history, comments, attachments, relations…")
     enriched = 0
 
     for start in range(0, len(issues), batch_size):
         batch = issues[start:start + batch_size]
-        # Build a query with one alias per issue
         alias_lines = []
         for i, iss in enumerate(batch):
+            iid = iss["id"]
             alias_lines.append(
-                "h" + str(i) + ': issue(id: "' + iss["id"] + '") {'
-                "  history(first: 50) {"
-                "    nodes { " + _HISTORY_NODE_FIELDS + " }"
-                "  }"
-                "}"
+                f'h{i}: issue(id: "{iid}") {{'
+                f'  history(first: 50)     {{ nodes {{ {_HISTORY_NODE_FIELDS} }} }}'
+                f'  comments(first: 50)    {{ nodes {{ {_ENRICH_COMMENT_FIELDS} }} }}'
+                f'  attachments(first: 50) {{ nodes {{ {_ENRICH_ATTACHMENT_FIELDS} }} }}'
+                f'  relations(first: 50)   {{ nodes {{ {_ENRICH_RELATION_FIELDS} }} }}'
+                f'}}'
             )
         query = "query { " + " ".join(alias_lines) + " }"
         try:
             data = gql(api_key, query)
         except Exception as exc:
-            # History not supported or too complex — skip silently
-            print(f"    (history skipped: {str(exc)[:80]})")
-            return
+            # Batch too complex — fall back to history-only for this batch
+            print(f"    (full enrich failed, retrying history-only: {str(exc)[:80]})")
+            alias_lines_fallback = []
+            for i, iss in enumerate(batch):
+                alias_lines_fallback.append(
+                    f'h{i}: issue(id: "{iss["id"]}") {{'
+                    f'  history(first: 50) {{ nodes {{ {_HISTORY_NODE_FIELDS} }} }}'
+                    f'}}'
+                )
+            fallback_query = "query { " + " ".join(alias_lines_fallback) + " }"
+            try:
+                data = gql(api_key, fallback_query)
+            except Exception as exc2:
+                print(f"    (history also skipped: {str(exc2)[:80]})")
+                continue
+
         for i, iss in enumerate(batch):
-            hist = (data.get("h" + str(i)) or {}).get("history") or {}
-            iss["history"] = {"nodes": hist.get("nodes") or []}
+            result = data.get(f"h{i}") or {}
+            iss["history"]     = result.get("history")     or {"nodes": []}
+            iss["comments"]    = result.get("comments")    or {"nodes": []}
+            iss["attachments"] = result.get("attachments") or {"nodes": []}
+            iss["relations"]   = result.get("relations")   or {"nodes": []}
             enriched += 1
 
-    print(f"    ✓ History enriched for {enriched} issue(s)")
+    print(f"    ✓ Enriched {enriched} issue(s)")
 
 
 def linear_download_file(url: str, api_key: str) -> Optional[bytes]:
@@ -1969,8 +2068,8 @@ def main() -> None:
         linear_users = []
 
     # Date range
-    days_raw = prompt("\n  Fetch issues created in the last N days (enter 0 for all time)",
-                      default="90")
+    days_raw = prompt("\n  Fetch issues updated in the last N days (enter 0 for all time)",
+                      default="0")
     try:
         days = int(days_raw)
         if days < 0:
@@ -1984,7 +2083,7 @@ def main() -> None:
         print("  → Fetching ALL issues (no date limit)")
     else:
         since_date = datetime.now(timezone.utc) - timedelta(days=days)
-        print(f"  → Issues created on or after {since_date.strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"  → Issues updated on or after {since_date.strftime('%Y-%m-%d %H:%M UTC')}")
 
     all_projects_by_team: dict = {}
     all_issues_by_team:   dict = {}
@@ -2002,10 +2101,38 @@ def main() -> None:
 
         print(f"  [{tname}] Fetching issues…")
         try:
-            raw = linear_fetch_all_issues(linear_key, team["id"], since_date)
+            probe = linear_probe_issues(linear_key, team["id"])
+            probe_str = "5+" if probe == -1 else str(probe)
+            print(f"  ✓ Probe (team.issues): {probe_str} issue(s) visible")
+            if probe == 0:
+                print("  ⚠  Probe returned 0 — will also check via project.issues below")
         except Exception as exc:
-            print(f"  Error: {exc}")
+            print(f"  ⚠  Probe failed: {exc}")
+
+        # Path 1: issues via team endpoint
+        try:
+            raw = linear_fetch_all_issues(linear_key, team["id"], since_date)
+            print(f"  ✓ team.issues returned {len(raw)} issue(s)")
+        except Exception as exc:
+            print(f"  Error fetching team issues: {exc}")
             raw = []
+
+        # Path 2: issues via each project endpoint (catches project-only items)
+        seen_ids = {iss["id"] for iss in raw}
+        for proj in projects:
+            try:
+                proj_issues = linear_fetch_project_issues(linear_key, proj["id"])
+                new_issues  = [i for i in proj_issues if i["id"] not in seen_ids]
+                if new_issues:
+                    print(f"  + project '{proj['name']}': {len(new_issues)} additional issue(s) not in team.issues")
+                    raw.extend(new_issues)
+                    seen_ids.update(i["id"] for i in new_issues)
+                else:
+                    print(f"  · project '{proj['name']}': {len(proj_issues)} issue(s) (all already seen)")
+            except Exception as exc:
+                print(f"  Warning: could not fetch issues for project '{proj['name']}': {exc}")
+
+        print(f"  ✓ {len(raw)} total raw issue(s) from both paths")
 
         kept = []
         n_triage = 0
@@ -2057,7 +2184,7 @@ def main() -> None:
   Migration summary:
     Linear teams to migrate:  {[t['name'] for t in mapped_teams]}
     Linear teams skipped:     {skipped_teams}
-    Date window:              {'ALL time' if days == 0 else f'last {days} day(s) (since {since_date.strftime("%Y-%m-%d")})'}
+    Date window:              {'ALL time' if days == 0 else f'updated in last {days} day(s) (since {since_date.strftime("%Y-%m-%d")})'}
     Total issues to migrate:  {total_issues}
     Triage items excluded:    {report['skipped_triage']}
     Linear users matched:     {matched}/{matched + unmatched}
