@@ -1074,8 +1074,57 @@ def build_preview_items(
     return items
 
 
+def _preview_detail_line(entry: dict) -> str:
+    """Build a detail string (assignee, labels, points, SLA/due, state) for one preview entry."""
+    if entry["is_project"]:
+        proj  = entry["item"]
+        lead  = (proj.get("lead") or {})
+        name  = lead.get("name") or lead.get("displayName") or "(no lead)"
+        email = lead.get("email") or ""
+        lead_str = f"{name} <{email}>" if email else name
+        state = (proj.get("state") or "").replace("_", " ")
+        parts = [f"Lead: {lead_str}"]
+        if state:
+            parts.append(f"State: {state}")
+        return "  " + "   ·   ".join(parts)
+
+    iss = entry["item"]
+
+    # Assignee
+    assignee = iss.get("assignee")
+    if assignee:
+        aname  = assignee.get("name") or assignee.get("displayName") or "?"
+        aemail = assignee.get("email") or ""
+        assignee_str = f"{aname} <{aemail}>" if aemail else aname
+    else:
+        assignee_str = "(unassigned)"
+
+    # Labels (all of them)
+    label_names = [l.get("name") for l in _nodes(iss.get("labels")) if l.get("name")]
+    labels_str  = ", ".join(label_names) if label_names else "—"
+
+    # Story points
+    estimate = iss.get("estimate")
+    pts_str  = str(int(estimate) if estimate == int(estimate) else estimate) if estimate is not None else "—"
+
+    # Due date / SLA
+    due_str = resolve_due_date(iss) or "—"
+
+    # State
+    state_str = (iss.get("state") or {}).get("name") or "?"
+
+    parts = [
+        f"Assignee: {assignee_str}",
+        f"Labels: {labels_str}",
+        f"Pts: {pts_str}",
+        f"Due/SLA: {due_str}",
+        f"State: {state_str}",
+    ]
+    return "  " + "   ·   ".join(parts)
+
+
 def print_preview_table(preview_items: list) -> None:
-    """Print the numbered preview table."""
+    """Print the numbered preview table with a detail line per item."""
     C_NUM   = 5
     C_ID    = 12
     C_TITLE = 44
@@ -1130,7 +1179,14 @@ def print_preview_table(preview_items: list) -> None:
         )
         print(f"│  {row}│")
 
-    print(f"│  {' ' * W}│")
+        # Detail line
+        detail = _preview_detail_line(entry)
+        # Pad or truncate to fit inside the box
+        if len(detail) > W:
+            detail = detail[:W - 1] + "…"
+        print(f"│  {detail:<{W}}│")
+        print(f"│  {' ' * W}│")
+
     print("└" + "─" * (W + 2) + "┘")
 
     n_epics  = sum(1 for e in preview_items if e["is_project"])
