@@ -54,10 +54,10 @@ JIRA_URL = "https://govpilot.atlassian.net"
 TEAM_SPACE_MAP: dict = {
     # Linear team name   →   Jira project key or display name
     "Desktop":               "Desktop",
-    "Web":                   "Core Team",
-    "Security": "Security",
-    "DevOps": "DevOps",
-    "Onboarding": "Onboarding"
+    #"Web":                   "Core Team",
+    #"Security": "Security",
+    #"DevOps": "DevOps",
+    #"Onboarding": "Onboarding"
 }
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -830,6 +830,14 @@ def determine_issue_type(issue: dict) -> str:
     return DEFAULT_ISSUE_TYPE
 
 
+def _parse_iso_to_date(s: str) -> Optional[str]:
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
 def resolve_due_date(issue: dict) -> Optional[str]:
     """Return YYYY-MM-DD due date from dueDate, Linear SLA, or SLI custom field."""
     if issue.get("dueDate"):
@@ -837,11 +845,9 @@ def resolve_due_date(issue: dict) -> Optional[str]:
     # Linear SLA due date
     sla_due = issue.get("slaDueAt")
     if sla_due:
-        try:
-            dt = datetime.fromisoformat(sla_due.replace("Z", "+00:00"))
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
+        result = _parse_iso_to_date(sla_due)
+        if result:
+            return result
     # Check custom fields for SLI / SLA indicators
     for cfv in (issue.get("customFieldValues") or []):
         cf = cfv.get("customField") or {}
@@ -850,11 +856,9 @@ def resolve_due_date(issue: dict) -> Optional[str]:
             val = cfv.get("value")
             if val:
                 # Try as ISO date string
-                try:
-                    dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                    return dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+                result = _parse_iso_to_date(str(val))
+                if result:
+                    return result
                 # Try as float days from creation
                 try:
                     created = datetime.fromisoformat(
@@ -938,11 +942,8 @@ def build_activity_comment_md(issue: dict) -> str:
 # Jira field helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_story_points_field(fields: list) -> Optional[str]:
-    # Substring match for unambiguous multi-word patterns
-    substrings = ["story point", "story_point", "storypoint"]
-    # Exact match only for short abbreviations (avoid "sp" as substring — it matches "responders")
-    exact = {"sp", "s.p.", "story pts", "story pt"}
+def _detect_field_by_keywords(fields: list, substrings: list,
+                               exact: frozenset = frozenset()) -> Optional[str]:
     for f in fields:
         name = (f.get("name") or "").lower().strip()
         if any(kw in name for kw in substrings) or name in exact:
@@ -950,13 +951,15 @@ def detect_story_points_field(fields: list) -> Optional[str]:
     return None
 
 
+def detect_story_points_field(fields: list) -> Optional[str]:
+    # Exact match only for short abbreviations (avoid "sp" as substring — it matches "responders")
+    return _detect_field_by_keywords(fields,
+        ["story point", "story_point", "storypoint"],
+        frozenset({"sp", "s.p.", "story pts", "story pt"}))
+
+
 def detect_epic_name_field(fields: list) -> Optional[str]:
-    keywords = ["epic name", "epic_name", "epicname"]
-    for f in fields:
-        name = (f.get("name") or "").lower()
-        if any(kw in name for kw in keywords):
-            return f["id"]
-    return None
+    return _detect_field_by_keywords(fields, ["epic name", "epic_name", "epicname"])
 
 
 def build_description_adf(issue: dict) -> dict:
@@ -978,7 +981,6 @@ def build_jira_fields(
     assignee_map:    dict,
     reporter_map:    dict,
     is_epic:         bool = False,
-    dry_run:         bool = False,
 ) -> dict:
     fields: dict = {}
     title = (issue.get("title") or "Untitled").strip()
@@ -1022,24 +1024,23 @@ def build_jira_fields(
     if jira_labels:
         fields["labels"] = jira_labels
 
-    if not dry_run:
-        assignee = issue.get("assignee")
-        if assignee:
-            ae = (assignee.get("email") or "").lower()
-            aid = assignee_map.get(ae) if ae else None
-            print(f"  ASSIGNEE  {issue.get('identifier') or issue.get('title','?')!r:<20}"
-                  f"  linear={ae or '(none)'}  mapped={'YES → '+aid[:8]+'…' if aid else 'NO'}")
-            if aid:
-                fields["assignee"] = {"accountId": aid}
-        else:
-            print(f"  ASSIGNEE  {issue.get('identifier') or issue.get('title','?')!r:<20}"
-                  f"  linear=(none)  mapped=NO")
+    assignee = issue.get("assignee")
+    if assignee:
+        ae = (assignee.get("email") or "").lower()
+        aid = assignee_map.get(ae) if ae else None
+        print(f"  ASSIGNEE  {issue.get('identifier') or issue.get('title','?')!r:<20}"
+              f"  linear={ae or '(none)'}  mapped={'YES → '+aid[:8]+'…' if aid else 'NO'}")
+        if aid:
+            fields["assignee"] = {"accountId": aid}
+    else:
+        print(f"  ASSIGNEE  {issue.get('identifier') or issue.get('title','?')!r:<20}"
+              f"  linear=(none)  mapped=NO")
 
-        creator = issue.get("creator")
-        if creator and creator.get("email"):
-            rid = reporter_map.get((creator["email"] or "").lower())
-            if rid:
-                fields["reporter"] = {"accountId": rid}
+    creator = issue.get("creator")
+    if creator and creator.get("email"):
+        rid = reporter_map.get((creator["email"] or "").lower())
+        if rid:
+            fields["reporter"] = {"accountId": rid}
 
     return fields
 
@@ -1233,6 +1234,20 @@ def save_mapping(mapping: dict) -> None:
 # Migration phases
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _check_existing_mapping(mapping: dict, key: str, label: str, jira) -> Optional[str]:
+    """Return existing jira_key if still valid, else clean mapping and return None."""
+    if key not in mapping:
+        return None
+    jkey = mapping[key]
+    if jira.issue_exists(jkey):
+        print(f"  SKIP  {label}  →  {jkey}  (already created)")
+        return jkey
+    print(f"  STALE {label}  →  {jkey} no longer exists — recreating")
+    del mapping[key]
+    save_mapping(mapping)
+    return None
+
+
 def phase_create_epics(
     projects:        list,
     project_key:     str,
@@ -1243,7 +1258,6 @@ def phase_create_epics(
     epic_name_field: Optional[str],
     assignee_map:    dict,
     linear_key:      str,
-    dry_run:         bool,
     report:          dict,
 ) -> dict:
     """Create a Jira Epic per Linear project. Returns {linear_project_id → jira_epic_key}."""
@@ -1256,16 +1270,10 @@ def phase_create_epics(
         pid          = proj["id"]
         mapping_key  = f"__epic__{pid}"
 
-        if mapping_key in mapping:
-            jkey = mapping[mapping_key]
-            if jira.issue_exists(jkey):
-                print(f"  SKIP  Epic [{proj['name']}]  →  {jkey}  (already created)")
-                epic_map[pid] = jkey
-                continue
-            else:
-                print(f"  STALE Epic [{proj['name']}]  →  {jkey} no longer exists — recreating")
-                del mapping[mapping_key]
-                save_mapping(mapping)
+        existing = _check_existing_mapping(mapping, mapping_key, f"Epic [{proj['name']}]", jira)
+        if existing:
+            epic_map[pid] = existing
+            continue
 
         proj_desc = (proj.get("description") or "").strip()
 
@@ -1284,39 +1292,34 @@ def phase_create_epics(
         fields = build_jira_fields(
             synthetic, project_key, "Epic", priority_map,
             sp_field_id, epic_name_field, epic_key=None,
-            assignee_map=assignee_map, reporter_map={}, is_epic=True, dry_run=dry_run,
+            assignee_map=assignee_map, reporter_map={}, is_epic=True,
         )
 
-        if dry_run:
-            dry_key = f"DRY-EPIC-{proj['name'][:20].replace(' ','-')}"
-            print(f"  DRY   Epic [{proj['name']}]  →  {dry_key}")
-            epic_map[pid] = dry_key
-        else:
-            try:
-                result        = jira.create_issue(fields)
-                jkey          = result["key"]
-                jira_issue_id = result.get("id", "")
-                epic_map[pid] = jkey
-                mapping[mapping_key] = jkey
-                save_mapping(mapping)
-                print(f"  OK    Epic [{proj['name']}]  →  {jkey}")
+        try:
+            result        = jira.create_issue(fields)
+            jkey          = result["key"]
+            jira_issue_id = result.get("id", "")
+            epic_map[pid] = jkey
+            mapping[mapping_key] = jkey
+            save_mapping(mapping)
+            print(f"  OK    Epic [{proj['name']}]  →  {jkey}")
 
-                if proj_desc:
-                    desc_adf = upload_images_and_build_description(
-                        proj_desc, jkey, jira_issue_id, f"Epic:{proj['name']}", jira, linear_key)
-                else:
-                    desc_adf = {"version": 1, "type": "doc", "content": []}
-                try:
-                    jira.update_issue(jkey, {"description": desc_adf})
-                    print(f"  OK    Epic [{proj['name']}]  description set on {jkey}")
-                except Exception as upd_exc:
-                    print(f"  FAIL  Epic [{proj['name']}]  description update FAILED: {upd_exc}")
-                    report["failed_issues"].append(
-                        {"id": f"Epic:{proj['name']} (description)", "reason": str(upd_exc)})
-            except Exception as exc:
-                print(f"  FAIL  Epic [{proj['name']}]  ({exc})")
+            if proj_desc:
+                desc_adf = upload_images_and_build_description(
+                    proj_desc, jkey, jira_issue_id, f"Epic:{proj['name']}", jira, linear_key)
+            else:
+                desc_adf = {"version": 1, "type": "doc", "content": []}
+            try:
+                jira.update_issue(jkey, {"description": desc_adf})
+                print(f"  OK    Epic [{proj['name']}]  description set on {jkey}")
+            except Exception as upd_exc:
+                print(f"  FAIL  Epic [{proj['name']}]  description update FAILED: {upd_exc}")
                 report["failed_issues"].append(
-                    {"id": f"Epic:{proj['name']}", "reason": str(exc)})
+                    {"id": f"Epic:{proj['name']} (description)", "reason": str(upd_exc)})
+        except Exception as exc:
+            print(f"  FAIL  Epic [{proj['name']}]  ({exc})")
+            report["failed_issues"].append(
+                {"id": f"Epic:{proj['name']}", "reason": str(exc)})
 
     return epic_map
 
@@ -1391,7 +1394,6 @@ def _create_one_issue(
     assignee_map:    dict,
     reporter_map:    dict,
     linear_key:      str,
-    dry_run:         bool,
     report:          dict,
 ) -> tuple:
     """
@@ -1401,20 +1403,12 @@ def _create_one_issue(
     linear_id  = issue.get("id", "")
     identifier = issue.get("identifier", "?")
 
-    if linear_id in mapping:
-        jkey_existing = mapping[linear_id]
-        if jira.issue_exists(jkey_existing):
-            print(f"  SKIP  {identifier}  →  {jkey_existing}  (already created)")
-            return False, True, False
-        else:
-            print(f"  STALE {identifier}  →  {jkey_existing} no longer exists — recreating")
-            del mapping[linear_id]
-            save_mapping(mapping)
+    existing = _check_existing_mapping(mapping, linear_id, identifier, jira)
+    if existing:
+        return False, True, False
 
     proj     = issue.get("project")
     epic_key = epic_map.get(proj["id"]) if proj else None
-    if epic_key and epic_key.startswith("DRY-"):
-        epic_key = None
 
     issue_type = determine_issue_type(issue)
     issue_desc = (issue.get("description") or "").strip()
@@ -1423,18 +1417,12 @@ def _create_one_issue(
         fields = build_jira_fields(
             issue, project_key, issue_type, priority_map,
             sp_field_id, epic_name_field, epic_key,
-            assignee_map, reporter_map, is_epic=False, dry_run=dry_run,
+            assignee_map, reporter_map, is_epic=False,
         )
     except Exception as exc:
         print(f"  FAIL  {identifier}  (field build: {exc})")
         report["failed_issues"].append({"id": identifier, "reason": str(exc)})
         return False, False, True
-
-    if dry_run:
-        dry_key = f"DRY-{identifier}"
-        print(f"  DRY   {identifier}  →  {dry_key}  [{issue_type}]  |  {fields['summary'][:50]}")
-        mapping[linear_id] = dry_key
-        return True, False, False
 
     try:
         result        = _try_create_issue(jira, fields)
@@ -1474,7 +1462,6 @@ def _run_issue_phase(
     assignee_map:    dict,
     reporter_map:    dict,
     linear_key:      str,
-    dry_run:         bool,
     report:          dict,
 ) -> None:
     """Print a header for `label`, iterate `subset`, delegate each to _create_one_issue."""
@@ -1486,98 +1473,48 @@ def _run_issue_phase(
         c, s, f = _create_one_issue(
             issue, project_key, epic_map, jira, mapping,
             priority_map, sp_field_id, epic_name_field,
-            assignee_map, reporter_map, linear_key, dry_run, report,
+            assignee_map, reporter_map, linear_key, report,
         )
         created += c; skipped += s; failed += f
     print(f"  {label} — created: {created}  skipped: {skipped}  failed: {failed}")
 
 
-def phase_create_bugs(
-    issues:          list,
-    project_key:     str,
-    epic_map:        dict,
-    jira:            JiraClient,
-    mapping:         dict,
-    priority_map:    dict,
-    sp_field_id:     Optional[str],
-    epic_name_field: Optional[str],
-    assignee_map:    dict,
-    reporter_map:    dict,
-    linear_key:      str,
-    dry_run:         bool,
-    report:          dict,
-) -> None:
+def _phase_issues(label, issues, filter_fn, project_key, epic_map, jira, mapping,
+                  priority_map, sp_field_id, epic_name_field,
+                  assignee_map, reporter_map, linear_key, report):
+    _run_issue_phase(
+        label, [i for i in issues if filter_fn(i)],
+        project_key, epic_map, jira, mapping,
+        priority_map, sp_field_id, epic_name_field,
+        assignee_map, reporter_map, linear_key, report,
+    )
+
+
+def phase_create_bugs(issues, *args) -> None:
     """Migrate issues whose Linear labels map to Jira type 'Bug'."""
-    bugs = [i for i in issues if determine_issue_type(i) == "Bug"]
-    _run_issue_phase(
-        "Bugs", bugs, project_key, epic_map, jira, mapping,
-        priority_map, sp_field_id, epic_name_field,
-        assignee_map, reporter_map, linear_key, dry_run, report,
-    )
+    _phase_issues("Bugs", issues, lambda i: determine_issue_type(i) == "Bug", *args)
 
 
-def phase_create_feature_requests(
-    issues:          list,
-    project_key:     str,
-    epic_map:        dict,
-    jira:            JiraClient,
-    mapping:         dict,
-    priority_map:    dict,
-    sp_field_id:     Optional[str],
-    epic_name_field: Optional[str],
-    assignee_map:    dict,
-    reporter_map:    dict,
-    linear_key:      str,
-    dry_run:         bool,
-    report:          dict,
-) -> None:
+def phase_create_feature_requests(issues, *args) -> None:
     """Migrate issues with a 'Feature Request' label (→ Jira Story)."""
-    frs = [
-        i for i in issues
-        if any((l.get("name") or "") == "Feature Request"
-               for l in _nodes(i.get("labels")))
-    ]
-    _run_issue_phase(
-        "Feature Requests", frs, project_key, epic_map, jira, mapping,
-        priority_map, sp_field_id, epic_name_field,
-        assignee_map, reporter_map, linear_key, dry_run, report,
-    )
+    _phase_issues("Feature Requests", issues,
+        lambda i: any((l.get("name") or "") == "Feature Request"
+                      for l in _nodes(i.get("labels"))),
+        *args)
 
 
-def phase_create_stories(
-    issues:          list,
-    project_key:     str,
-    epic_map:        dict,
-    jira:            JiraClient,
-    mapping:         dict,
-    priority_map:    dict,
-    sp_field_id:     Optional[str],
-    epic_name_field: Optional[str],
-    assignee_map:    dict,
-    reporter_map:    dict,
-    linear_key:      str,
-    dry_run:         bool,
-    report:          dict,
-) -> None:
+def phase_create_stories(issues, *args) -> None:
     """Migrate remaining issues that are neither Bugs nor Feature Requests (→ Jira Story)."""
-    type_label_names = {"Bug", "Feature Request"}
-    stories = [
-        i for i in issues
-        if not any((l.get("name") or "") in type_label_names
-                   for l in _nodes(i.get("labels")))
-    ]
-    _run_issue_phase(
-        "Stories", stories, project_key, epic_map, jira, mapping,
-        priority_map, sp_field_id, epic_name_field,
-        assignee_map, reporter_map, linear_key, dry_run, report,
-    )
+    _type_label_names = {"Bug", "Feature Request"}
+    _phase_issues("Stories", issues,
+        lambda i: not any((l.get("name") or "") in _type_label_names
+                          for l in _nodes(i.get("labels"))),
+        *args)
 
 
-def phase_move_to_backlog(mapping: dict, jira: JiraClient, dry_run: bool) -> None:
-    if dry_run:
-        return
+def phase_move_to_backlog(mapping: dict, jira: JiraClient) -> None:
     keys = [v for v in mapping.values()
-            if v and not v.startswith("DRY-") and not v.startswith("__")]
+            if v and not v.startswith("__")]
     if not keys:
         return
     print(f"\n  Moving {len(keys)} issue(s) to backlog…")
@@ -1595,7 +1532,6 @@ def phase_upload_attachments(
     mapping:    dict,
     jira:       JiraClient,
     linear_key: str,
-    dry_run:    bool,
     report:     dict,
 ) -> None:
     uploaded = skipped = failed = 0
@@ -1603,7 +1539,7 @@ def phase_upload_attachments(
         linear_id  = issue.get("id", "")
         identifier = issue.get("identifier", "?")
         jira_key   = mapping.get(linear_id)
-        if not jira_key or jira_key.startswith("DRY-"):
+        if not jira_key:
             continue
 
         for att in _nodes(issue.get("attachments")):
@@ -1611,10 +1547,6 @@ def phase_upload_attachments(
             title = att.get("title") or "attachment"
             if not url:
                 skipped += 1
-                continue
-            if dry_run:
-                print(f"  DRY   {identifier}  attach: {title[:50]}")
-                uploaded += 1
                 continue
 
             filename = os.path.basename(url.split("?")[0]) or title
@@ -1651,7 +1583,6 @@ def phase_post_activity_comments(
     issues:  list,
     mapping: dict,
     jira:    JiraClient,
-    dry_run: bool,
     report:  dict,
 ) -> None:
     posted = skipped = failed = 0
@@ -1659,7 +1590,7 @@ def phase_post_activity_comments(
         linear_id  = issue.get("id", "")
         identifier = issue.get("identifier", "?")
         jira_key   = mapping.get(linear_id)
-        if not jira_key or jira_key.startswith("DRY-"):
+        if not jira_key:
             skipped += 1
             continue
 
@@ -1667,14 +1598,6 @@ def phase_post_activity_comments(
         has_comments = bool(_nodes(issue.get("comments")))
         if not has_history and not has_comments:
             skipped += 1
-            continue
-
-        if dry_run:
-            n_hist = len(_nodes(issue.get("history")))
-            n_cmts = len(_nodes(issue.get("comments")))
-            print(f"  DRY   {identifier}  →  {jira_key}  "
-                  f"activity comment ({n_hist} events, {n_cmts} comments)")
-            posted += 1
             continue
 
         md  = build_activity_comment_md(issue)
@@ -1694,7 +1617,6 @@ def phase_create_links(
     issues:  list,
     mapping: dict,
     jira:    JiraClient,
-    dry_run: bool,
     report:  dict,
 ) -> None:
     created = skipped = failed = 0
@@ -1703,14 +1625,14 @@ def phase_create_links(
     for issue in issues:
         linear_id = issue.get("id", "")
         jira_key  = mapping.get(linear_id)
-        if not jira_key or jira_key.startswith("DRY-"):
+        if not jira_key:
             continue
 
         for rel in _nodes(issue.get("relations")):
             rel_type    = (rel.get("type") or "").lower()
             related_id  = (rel.get("relatedIssue") or {}).get("id", "")
             related_key = mapping.get(related_id)
-            if not related_key or related_key.startswith("DRY-"):
+            if not related_key:
                 skipped += 1
                 continue
 
@@ -1725,16 +1647,12 @@ def phase_create_links(
                 continue
             linked_pairs.add(pair)
 
-            if dry_run:
-                print(f"  DRY   {link_type}  {outward}  →  {inward}")
+            try:
+                jira.create_issue_link(link_type, outward, inward)
                 created += 1
-            else:
-                try:
-                    jira.create_issue_link(link_type, outward, inward)
-                    created += 1
-                except Exception as exc:
-                    print(f"  FAIL  {link_type}  {outward}  →  {inward}  ({exc})")
-                    failed += 1
+            except Exception as exc:
+                print(f"  FAIL  {link_type}  {outward}  →  {inward}  ({exc})")
+                failed += 1
 
     print(f"\n  Issue links — created: {created}  skipped: {skipped}  failed: {failed}")
 
@@ -2079,9 +1997,6 @@ def main() -> None:
 
     # ── Step 5: Confirm ────────────────────────────────────────────────────────
     print("\nStep 5 — Confirm")
-    dry_raw = prompt("Dry run (no writes to Jira)? (y/n)", default="y").lower()
-    dry_run = dry_raw in ("y", "yes")
-
     print(f"""
   Migration summary:
     Linear teams to migrate:  {[t['name'] for t in mapped_teams]}
@@ -2092,7 +2007,6 @@ def main() -> None:
     Linear users matched:     {matched}/{matched + unmatched}
     Jira URL:                 {JIRA_URL}
     Story points field:       {sp_field_id or '(skipped)'}
-    Mode:                     {'DRY RUN' if dry_run else 'LIVE'}
     Mapping file:             {MAPPING_FILE}
 """)
 
@@ -2142,7 +2056,7 @@ def main() -> None:
         sys.exit(0)
 
     # ── Migration ──────────────────────────────────────────────────────────────
-    mapping = load_mapping() if not dry_run else {}
+    mapping = load_mapping()
     all_issues_flat: list = []
 
     for team in mapped_teams:
@@ -2166,14 +2080,14 @@ def main() -> None:
         epic_map = phase_create_epics(
             projects, project_key, jira, mapping,
             DEFAULT_PRIORITY_MAP, sp_field_id, epic_name_field,
-            user_map, linear_key, dry_run, report,
+            user_map, linear_key, report,
         )
 
         # Issues — one phase per type
         _issue_args = (
             project_key, epic_map, jira, mapping,
             DEFAULT_PRIORITY_MAP, sp_field_id, epic_name_field,
-            user_map, user_map, linear_key, dry_run, report,
+            user_map, user_map, linear_key, report,
         )
         phase_create_bugs(issues,             *_issue_args)
         phase_create_feature_requests(issues, *_issue_args)
@@ -2184,33 +2098,31 @@ def main() -> None:
     # Backlog
     print("\n" + "─" * W)
     print("  Moving all issues to backlog…")
-    phase_move_to_backlog(mapping, jira, dry_run)
+    phase_move_to_backlog(mapping, jira)
 
     # Attachments
     print("\n" + "─" * W)
     print("  Uploading attachments…")
-    phase_upload_attachments(all_issues_flat, mapping, jira, linear_key, dry_run, report)
+    phase_upload_attachments(all_issues_flat, mapping, jira, linear_key, report)
 
     # Activity comments
     print("\n" + "─" * W)
     print("  Posting consolidated activity comments…")
-    phase_post_activity_comments(all_issues_flat, mapping, jira, dry_run, report)
+    phase_post_activity_comments(all_issues_flat, mapping, jira, report)
 
     # Issue links
     print("\n" + "─" * W)
     print("  Creating issue links…")
-    phase_create_links(all_issues_flat, mapping, jira, dry_run, report)
+    phase_create_links(all_issues_flat, mapping, jira, report)
 
     # ── Final report ───────────────────────────────────────────────────────────
     print()
     print("╔" + "═" * (W - 2) + "╗")
-    mode = "DRY RUN" if dry_run else "LIVE"
-    print("║" + f"  Migration complete ({mode})".center(W - 2) + "║")
+    print("║" + "  Migration complete".center(W - 2) + "║")
     print("╚" + "═" * (W - 2) + "╝")
 
-    if not dry_run:
-        print(f"\n  Mapping saved to: {MAPPING_FILE}")
-        print(f"  Total entries:    {len(mapping)}")
+    print(f"\n  Mapping saved to: {MAPPING_FILE}")
+    print(f"  Total entries:    {len(mapping)}")
 
     print(f"\n  Triage items excluded:  {report['skipped_triage']}")
     print(f"  Teams skipped:          {report['skipped_teams']}")
@@ -2223,21 +2135,21 @@ def main() -> None:
             suffix = f"  →  jira: {je}" if je else "  →  jira: (empty — fill manually)"
             print(f"       {u['name']:<30}  {u['email']}{suffix}")
 
-    if report["failed_issues"]:
-        print(f"\n  ✗  Failed issues ({len(report['failed_issues'])}):")
-        for fi in report["failed_issues"]:
-            print(f"       {fi['id']}:  {fi['reason'][:80]}")
-
-    if report["failed_attachments"]:
-        print(f"\n  ✗  Failed attachments ({len(report['failed_attachments'])}):")
-        for fa in report["failed_attachments"]:
-            detail = fa.get("filename", fa.get("url", "?"))
-            print(f"       {fa.get('issue','?')}:  {detail[:60]}  — {fa.get('reason','')[:40]}")
-
-    if report["failed_comments"]:
-        print(f"\n  ✗  Failed activity comments ({len(report['failed_comments'])}):")
-        for fc in report["failed_comments"]:
-            print(f"       {fc['issue']}:  {fc['reason'][:80]}")
+    _REPORT_SECTIONS = [
+        ("failed_issues",      "Failed issues",
+         lambda e: f"       {e['id']}:  {e['reason'][:80]}"),
+        ("failed_attachments", "Failed attachments",
+         lambda e: f"       {e.get('issue','?')}:  "
+                   f"{e.get('filename', e.get('url', '?'))[:60]}  — {e.get('reason','')[:40]}"),
+        ("failed_comments",    "Failed activity comments",
+         lambda e: f"       {e['issue']}:  {e['reason'][:80]}"),
+    ]
+    for key, title, fmt in _REPORT_SECTIONS:
+        items = report.get(key) or []
+        if items:
+            print(f"\n  ✗  {title} ({len(items)}):")
+            for item in items:
+                print(fmt(item))
 
     if not any([report["failed_issues"], report["failed_attachments"],
                 report["failed_comments"], report["unmatched_users"]]):
