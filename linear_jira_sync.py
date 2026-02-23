@@ -216,12 +216,13 @@ def linear_fetch_projects(api_key: str, team_id: str) -> list:
 _FIELDS_FULL = """
     id identifier title description priority priorityLabel
     estimate dueDate createdAt updatedAt completedAt canceledAt archivedAt
+    slaBreachesAt slaStartedAt
     url branchName
     state        { id name type color }
     assignee     { id name email displayName }
     creator      { id name email displayName }
     labels(first: 10) { nodes { id name color } }
-    project      { id name state description url }
+    project      { id name state description url targetDate }
     team         { id name key }
     parent       { id identifier title }
 """
@@ -235,7 +236,7 @@ _FIELDS_SAFE = """
     assignee     { id name email displayName }
     creator      { id name email displayName }
     labels(first: 10) { nodes { id name color } }
-    project      { id name state description url }
+    project      { id name state description url targetDate }
     team         { id name key }
     parent       { id identifier title }
 """
@@ -938,15 +939,19 @@ def _parse_iso_to_date(s: str) -> Optional[str]:
 
 
 def resolve_due_date(issue: dict) -> Optional[str]:
-    """Return YYYY-MM-DD due date from dueDate, Linear SLA, or SLI custom field."""
+    """Return YYYY-MM-DD due date from dueDate, slaBreachesAt, project targetDate, or SLI custom field."""
     if issue.get("dueDate"):
         return issue["dueDate"]
-    # Linear SLA due date
-    sla_due = issue.get("slaDueAt")
+    # Linear SLA breach deadline (available on Business/Enterprise plans)
+    sla_due = issue.get("slaBreachesAt")
     if sla_due:
         result = _parse_iso_to_date(sla_due)
         if result:
             return result
+    # Fall back to the parent project's target date (shown as due date in Linear UI)
+    project_target = (issue.get("project") or {}).get("targetDate")
+    if project_target:
+        return project_target
     # Check custom fields for SLI / SLA indicators
     for cfv in (issue.get("customFieldValues") or []):
         cf = cfv.get("customField") or {}
@@ -1206,8 +1211,19 @@ def _preview_detail_line(entry: dict) -> str:
     estimate = iss.get("estimate")
     pts_str  = str(int(estimate) if estimate == int(estimate) else estimate) if estimate is not None else "—"
 
-    # Due date / SLA
-    due_str = resolve_due_date(iss) or "—"
+    # Due date and SLA — show separately so both are visible
+    due_date_str = iss.get("dueDate") or ""
+    sla_breach   = _parse_iso_to_date(iss.get("slaBreachesAt") or "") or ""
+    proj_target  = (iss.get("project") or {}).get("targetDate") or ""
+    effective_due = due_date_str or proj_target
+    if effective_due and sla_breach:
+        date_str = f"Due: {effective_due}   SLA: {sla_breach}"
+    elif sla_breach:
+        date_str = f"SLA: {sla_breach}"
+    elif effective_due:
+        date_str = f"Due: {effective_due}"
+    else:
+        date_str = "—"
 
     # State
     state_str = (iss.get("state") or {}).get("name") or "?"
@@ -1216,7 +1232,7 @@ def _preview_detail_line(entry: dict) -> str:
         f"Assignee: {assignee_str}",
         f"Labels: {labels_str}",
         f"Pts: {pts_str}",
-        f"Due/SLA: {due_str}",
+        date_str,
         f"State: {state_str}",
     ]
     return "  " + "   ·   ".join(parts)
