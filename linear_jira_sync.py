@@ -442,6 +442,49 @@ def linear_download_file(url: str, api_key: str) -> Optional[bytes]:
 _IMAGE_PATTERN = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 _IMAGE_SPLIT_PATTERN = re.compile(r'(!\[[^\]]*\]\([^)]+\))')
 
+# ANSI terminal colours used in the preview table
+_C_GREEN  = "\033[92m"   # assignee/lead mapped to a Jira user
+_C_RED    = "\033[91m"   # assignee/lead present but NOT mapped — add to user_mapping.csv
+_C_RESET  = "\033[0m"
+_ANSI_RE  = re.compile(r'\033\[[0-9;]*m')
+
+
+def _visible_len(s: str) -> int:
+    """Return the printable character count of s (excluding ANSI escape codes)."""
+    return len(_ANSI_RE.sub('', s))
+
+
+def _pad_detail(s: str, width: int) -> str:
+    """Right-pad s to `width` visible characters (ANSI-aware)."""
+    return s + ' ' * max(0, width - _visible_len(s))
+
+
+def _truncate_ansi(s: str, max_visible: int) -> str:
+    """
+    Truncate s so its visible length is at most max_visible, preserving ANSI
+    escape codes and always appending a reset so the terminal is left clean.
+    """
+    result: list = []
+    visible = 0
+    i = 0
+    while i < len(s):
+        if s[i] == '\033' and i + 1 < len(s) and s[i + 1] == '[':
+            # Consume the full ANSI sequence (ends at 'm')
+            j = s.find('m', i + 2)
+            if j >= 0:
+                result.append(s[i:j + 1])
+                i = j + 1
+                continue
+        if visible < max_visible:
+            result.append(s[i])
+            visible += 1
+        elif visible == max_visible:
+            result.append('…')
+            visible += 1
+        i += 1
+    result.append(_C_RESET)
+    return ''.join(result)
+
 
 def extract_image_urls(markdown: str) -> list:
     """Return list of (alt, url) tuples for all Markdown images in text."""
@@ -1178,14 +1221,22 @@ def build_preview_items(
     return items
 
 
-def _preview_detail_line(entry: dict) -> str:
+def _preview_detail_line(entry: dict, user_map: dict, user_label_map: dict) -> str:
     """Build a detail string (assignee, labels, points, SLA/due, state) for one preview entry."""
     if entry["is_project"]:
         proj  = entry["item"]
         lead  = (proj.get("lead") or {})
         name  = lead.get("name") or lead.get("displayName") or "(no lead)"
-        email = lead.get("email") or ""
-        lead_str = f"{name} <{email}>" if email else name
+        email = (lead.get("email") or "").lower()
+        if email:
+            if user_map.get(email):
+                jira_label = user_label_map.get(email, "")
+                raw = f"{name} → {jira_label}" if jira_label else name
+                lead_str = f"{_C_GREEN}{raw}{_C_RESET}"
+            else:
+                lead_str = f"{_C_RED}{name} <{email}>{_C_RESET}"
+        else:
+            lead_str = name
         state = (proj.get("state") or "").replace("_", " ")
         parts = [f"Lead: {lead_str}"]
         if state:
@@ -1194,12 +1245,20 @@ def _preview_detail_line(entry: dict) -> str:
 
     iss = entry["item"]
 
-    # Assignee
+    # Assignee — green + Jira name if mapped, red if not, plain if unassigned
     assignee = iss.get("assignee")
     if assignee:
         aname  = assignee.get("name") or assignee.get("displayName") or "?"
-        aemail = assignee.get("email") or ""
-        assignee_str = f"{aname} <{aemail}>" if aemail else aname
+        aemail = (assignee.get("email") or "").lower()
+        if aemail:
+            if user_map.get(aemail):
+                jira_label = user_label_map.get(aemail, "")
+                raw = f"{aname} → {jira_label}" if jira_label else aname
+                assignee_str = f"{_C_GREEN}{raw}{_C_RESET}"
+            else:
+                assignee_str = f"{_C_RED}{aname} <{aemail}>{_C_RESET}"
+        else:
+            assignee_str = aname
     else:
         assignee_str = "(unassigned)"
 
@@ -1238,7 +1297,8 @@ def _preview_detail_line(entry: dict) -> str:
     return "  " + "   ·   ".join(parts)
 
 
-def print_preview_table(preview_items: list) -> None:
+def print_preview_table(preview_items: list, user_map: dict,
+                        user_label_map: dict) -> None:
     """Print the numbered preview table with a detail line per item."""
     C_NUM   = 5
     C_ID    = 12
@@ -1294,12 +1354,11 @@ def print_preview_table(preview_items: list) -> None:
         )
         print(f"│  {row}│")
 
-        # Detail line
-        detail = _preview_detail_line(entry)
-        # Pad or truncate to fit inside the box
-        if len(detail) > W:
-            detail = detail[:W - 1] + "…"
-        print(f"│  {detail:<{W}}│")
+        # Detail line (may contain ANSI codes — use visible-length helpers)
+        detail = _preview_detail_line(entry, user_map, user_label_map)
+        if _visible_len(detail) > W:
+            detail = _truncate_ansi(detail, W - 1)
+        print(f"│  {_pad_detail(detail, W)}│")
         print(f"│  {' ' * W}│")
 
     print("└" + "─" * (W + 2) + "┘")
@@ -1863,9 +1922,13 @@ def save_user_csv(csv_map: dict) -> None:
 
 
 def build_user_map(linear_users: list, jira_users: list, report: dict,
-                   jira: "JiraClient" = None) -> dict:
+                   jira: "JiraClient" = None) -> tuple:
     """
-    Build {linear_email → jira_accountId} for all matchable users.
+    Build user maps for all matchable users.
+
+    Returns (user_map, user_label_map) where:
+      user_map       = {linear_email → jira_accountId}
+      user_label_map = {linear_email → "JiraDisplayName <jira_email>"}  (matched only)
 
     Strategy:
       1. Load user_mapping.csv (persisted across runs).
@@ -1878,12 +1941,14 @@ def build_user_map(linear_users: list, jira_users: list, report: dict,
            - If not found there, do a targeted individual lookup via Jira API
              (catches users missing from the bulk search: guests, inactive, etc.)
     """
-    # Jira bulk lookup: email → accountId
-    jira_by_email: dict = {}
+    # Jira bulk lookup: email → accountId, email → displayName
+    jira_by_email:   dict = {}
+    jira_names:      dict = {}
     for ju in jira_users:
         email = (ju.get("emailAddress") or "").lower()
         if email:
             jira_by_email[email] = ju["accountId"]
+            jira_names[email]    = ju.get("displayName") or email
 
     # Load / update CSV
     csv_map = load_user_csv()
@@ -1899,8 +1964,9 @@ def build_user_map(linear_users: list, jira_users: list, report: dict,
         save_user_csv(csv_map)
 
     # Build accountId map — with individual-lookup fallback
-    user_map:  dict = {}
-    unmatched: list = []
+    user_map:       dict = {}
+    user_label_map: dict = {}
+    unmatched:      list = []
     for lu in linear_users:
         le = (lu.get("email") or "").lower()
         if not le:
@@ -1913,13 +1979,15 @@ def build_user_map(linear_users: list, jira_users: list, report: dict,
                 # Targeted lookup — finds users missed by the bulk search
                 aid = jira.resolve_account_id(je)
         if aid:
-            user_map[le] = aid
+            user_map[le]       = aid
+            jname              = jira_names.get(je) or je
+            user_label_map[le] = f"{jname} <{je}>"
         else:
             unmatched.append({"name": lu.get("name", "?"), "email": le,
                               "jira_email": je})
 
     report["unmatched_users"] = unmatched
-    return user_map
+    return user_map, user_label_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2178,7 +2246,7 @@ def main() -> None:
         print(f"  Warning: {exc}")
         jira_users = []
 
-    user_map = build_user_map(linear_users, jira_users, report, jira=jira)
+    user_map, user_label_map = build_user_map(linear_users, jira_users, report, jira=jira)
     matched   = len(user_map)
     unmatched = len(report["unmatched_users"])
     print(f"  ✓ User mapping: {matched} matched, {unmatched} unmatched")
@@ -2210,7 +2278,7 @@ def main() -> None:
 """)
 
     preview_items = build_preview_items(mapped_teams, all_issues_by_team, all_projects_by_team)
-    print_preview_table(preview_items)
+    print_preview_table(preview_items, user_map, user_label_map)
 
     # Let the user pick specific items or migrate everything
     print("  Select items to migrate:")
