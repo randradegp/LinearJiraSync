@@ -1662,6 +1662,24 @@ def _create_one_issue(
         save_mapping(mapping)
         print(f"  OK    {identifier}  →  {jira_key}  [{issue_type}]  |  {fields['summary'][:45]}")
 
+        # Story points: post as a comment so the value is always visible in Jira
+        # regardless of whether the custom field is configured for this project.
+        estimate = issue.get("estimate")
+        if estimate is not None:
+            sp_val = int(estimate) if estimate == int(estimate) else float(estimate)
+            sp_adf = {
+                "version": 1, "type": "doc",
+                "content": [{"type": "paragraph", "content": [
+                    {"type": "text", "text": "Linear Story Points: ",
+                     "marks": [{"type": "strong"}]},
+                    {"type": "text", "text": str(sp_val)},
+                ]}],
+            }
+            try:
+                jira.add_comment(jira_key, sp_adf)
+            except Exception as sp_exc:
+                print(f"  WARN  {identifier}  story points comment failed: {sp_exc}")
+
         if issue_desc:
             desc_adf = upload_images_and_build_description(
                 issue_desc, jira_key, jira_issue_id, identifier, jira, linear_key)
