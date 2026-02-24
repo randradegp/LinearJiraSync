@@ -79,6 +79,15 @@ TRIAGE_LABEL_NAMES = set()
 MAPPING_FILE      = "linear_jira_mapping.json"
 USER_MAPPING_FILE = "user_mapping.csv"
 
+# ---------------------------------------------------------------------------
+# STORY_POINTS_FIELD
+# Jira custom field ID for Story Points.  Set this to override auto-detection.
+# Find it by pinning the field in Jira and watching the network request, e.g.:
+#   PUT /rest/api/2/mypreferences?key=…pinned-fields.XXX  payload: customfield_NNNNN
+# Leave as None to fall back to name-based auto-detection.
+# ---------------------------------------------------------------------------
+STORY_POINTS_FIELD: str = "customfield_10104"
+
 DEFAULT_PRIORITY_MAP: dict = {
     "Urgent":      "Highest",
     "High":        "High",
@@ -1149,9 +1158,10 @@ def build_jira_fields(
     linear_p = issue.get("priorityLabel") or "No priority"
     fields["priority"] = {"name": priority_map.get(linear_p, "Medium")}
 
-    # Story points (Linear estimate)
+    # Story points (Linear estimate) — Jira expects an integer
     if sp_field_id and issue.get("estimate") is not None:
-        fields[sp_field_id] = float(issue["estimate"])
+        est = issue["estimate"]
+        fields[sp_field_id] = int(est) if est == int(est) else float(est)
 
     # Due date (dueDate or SLI custom field)
     due = resolve_due_date(issue)
@@ -1662,33 +1672,20 @@ def _create_one_issue(
         save_mapping(mapping)
         print(f"  OK    {identifier}  →  {jira_key}  [{issue_type}]  |  {fields['summary'][:45]}")
 
-        # Story points: post as a comment so the value is always visible in Jira
-        # regardless of whether the custom field is configured for this project.
-        estimate = issue.get("estimate")
-        if estimate is not None:
-            sp_val = int(estimate) if estimate == int(estimate) else float(estimate)
-            sp_adf = {
-                "version": 1, "type": "doc",
-                "content": [{"type": "paragraph", "content": [
-                    {"type": "text", "text": "Linear Story Points: ",
-                     "marks": [{"type": "strong"}]},
-                    {"type": "text", "text": str(sp_val)},
-                ]}],
-            }
-            try:
-                jira.add_comment(jira_key, sp_adf)
-            except Exception as sp_exc:
-                print(f"  WARN  {identifier}  story points comment failed: {sp_exc}")
-
         if issue_desc:
             desc_adf = upload_images_and_build_description(
                 issue_desc, jira_key, jira_issue_id, identifier, jira, linear_key)
         else:
             desc_adf = {"version": 1, "type": "doc", "content": []}
+        update_fields: dict = {"description": desc_adf}
+        estimate = issue.get("estimate")
+        if sp_field_id and estimate is not None:
+            sp_val = int(estimate) if estimate == int(estimate) else float(estimate)
+            update_fields[sp_field_id] = sp_val
         try:
-            jira.update_issue(jira_key, {"description": desc_adf})
+            jira.update_issue(jira_key, update_fields)
         except Exception as upd_exc:
-            print(f"  WARN  {identifier}  description update failed: {upd_exc}")
+            print(f"  WARN  {identifier}  update failed: {upd_exc}")
 
         return True, False, False
     except Exception as exc:
@@ -2344,12 +2341,13 @@ def main() -> None:
     print("  Jira custom fields…")
     try:
         all_fields      = jira.get_fields()
-        sp_field_id     = detect_story_points_field(all_fields)
+        sp_field_id     = STORY_POINTS_FIELD or detect_story_points_field(all_fields)
         epic_name_field = detect_epic_name_field(all_fields)
     except Exception as exc:
         print(f"  Warning: {exc}")
-        sp_field_id, epic_name_field = None, None
-    print(f"  Story points field: {sp_field_id or '(not detected)'}")
+        sp_field_id, epic_name_field = STORY_POINTS_FIELD or None, None
+    src = "config" if STORY_POINTS_FIELD else ("detected" if sp_field_id else "not detected")
+    print(f"  Story points field: {sp_field_id or '(not detected)'}  [{src}]")
     print(f"  Epic name field:    {epic_name_field or '(not detected)'}")
 
     # ── Step 5: Confirm ────────────────────────────────────────────────────────
