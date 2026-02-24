@@ -2169,23 +2169,24 @@ def main() -> None:
         print(f"  Warning: {exc}")
         linear_users = []
 
-    # Date range
-    days_raw = prompt("\n  Fetch issues updated in the last N days (enter 0 for all time)",
-                      default="0")
-    try:
-        days = int(days_raw)
-        if days < 0:
-            raise ValueError
-    except ValueError:
-        print("  Invalid input, defaulting to 90 days.")
-        days = 90
+    # Date range — default 180 days (≈ 6 months), maximum 180 days
+    while True:
+        days_raw = prompt("\n  Fetch issues updated in the last N days (0 = all time, max 180)",
+                          default="180")
+        try:
+            days = int(days_raw)
+            if days < 0 or days > 180:
+                raise ValueError
+            break
+        except ValueError:
+            print("  Invalid input — enter a number between 0 and 180.")
 
     if days == 0:
         since_date: Optional[datetime] = None
         print("  → Fetching ALL issues (no date limit)")
     else:
         since_date = datetime.now(timezone.utc) - timedelta(days=days)
-        print(f"  → Issues updated on or after {since_date.strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"  → Issues updated on or after {since_date.strftime('%Y-%m-%d')}  ({days} days)")
 
     all_projects_by_team: dict = {}
     all_issues_by_team:   dict = {}
