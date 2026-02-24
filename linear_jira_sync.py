@@ -2190,6 +2190,9 @@ def main() -> None:
     all_projects_by_team: dict = {}
     all_issues_by_team:   dict = {}
 
+    # ── Phase A: fetch + triage-filter all teams (no enrichment yet) ──────────
+    all_raw_by_team: dict = {}   # tname → list of triage-filtered issues
+
     for team in mapped_teams:
         tname = team["name"]
         print(f"\n  [{tname}] Fetching projects…")
@@ -2245,11 +2248,79 @@ def main() -> None:
                 kept.append(iss)
         report["skipped_triage"] += n_triage
         print(f"  ✓ {len(kept)} issue(s) kept  ({n_triage} triage excluded)")
+        all_raw_by_team[tname] = kept
 
-        # Enrich with history (separate queries — too complex to inline)
-        linear_enrich_with_history(linear_key, kept)
+    # ── Phase B: label filter prompt ──────────────────────────────────────────
+    all_raw_issues = [iss for issues in all_raw_by_team.values() for iss in issues]
+    all_label_names: list = sorted({
+        lbl.get("name") for iss in all_raw_issues
+        for lbl in _nodes(iss.get("labels")) if lbl.get("name")
+    })
 
-        all_issues_by_team[tname] = kept
+    include_labels: set = set()
+    exclude_labels: set = set()
+
+    if all_label_names:
+        print(f"\n  Available labels across all fetched issues ({len(all_label_names)}):")
+        # Build count map and print numbered list
+        label_counts = {}
+        for lname in all_label_names:
+            label_counts[lname] = sum(
+                1 for iss in all_raw_issues
+                if any(l.get("name") == lname for l in _nodes(iss.get("labels")))
+            )
+        for idx, lname in enumerate(all_label_names, 1):
+            print(f"    {idx:>3}.  {lname}  ({label_counts[lname]} issue(s))")
+
+        n_labels = len(all_label_names)
+        print(f"\n  Use numbers, ranges (e.g. 2-4), or comma-separated (e.g. 1,3,5-7).")
+        print(f"  Enter 'all' or leave blank to skip the filter.")
+
+        while True:
+            raw_inc = prompt("  Include ONLY labels", default="all")
+            try:
+                inc_nums = parse_selection(raw_inc, n_labels)  # None = all / no filter
+                break
+            except ValueError as e:
+                print(f"  Invalid input: {e}. Try again.")
+        if inc_nums is not None:
+            include_labels = {all_label_names[n - 1] for n in inc_nums}
+            print(f"  → Include: {', '.join(sorted(include_labels))}")
+
+        while True:
+            raw_exc = prompt("  Exclude labels      ", default="")
+            try:
+                exc_nums = parse_selection(raw_exc, n_labels)  # None = all (skip)
+                break
+            except ValueError as e:
+                print(f"  Invalid input: {e}. Try again.")
+        if exc_nums is not None and raw_exc.strip() not in ("all", "a", ""):
+            exclude_labels = {all_label_names[n - 1] for n in exc_nums}
+            print(f"  → Exclude: {', '.join(sorted(exclude_labels))}")
+    else:
+        print("\n  No labels found on fetched issues — label filter skipped.")
+
+    # ── Phase C: apply label filter + enrich ──────────────────────────────────
+    for tname, issues in all_raw_by_team.items():
+        filtered = []
+        n_label_filtered = 0
+        for iss in issues:
+            iss_labels = {lbl.get("name") for lbl in _nodes(iss.get("labels")) if lbl.get("name")}
+            if include_labels and not (iss_labels & include_labels):
+                n_label_filtered += 1
+                continue
+            if exclude_labels and (iss_labels & exclude_labels):
+                n_label_filtered += 1
+                continue
+            filtered.append(iss)
+
+        if n_label_filtered:
+            print(f"  [{tname}] {n_label_filtered} issue(s) removed by label filter  "
+                  f"({len(filtered)} remaining)")
+
+        # Enrich with history, comments, attachments, relations
+        linear_enrich_with_history(linear_key, filtered)
+        all_issues_by_team[tname] = filtered
 
     total_issues = sum(len(v) for v in all_issues_by_team.values())
 
