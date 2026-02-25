@@ -53,8 +53,8 @@ JIRA_URL = "https://govpilot.atlassian.net"
 # ---------------------------------------------------------------------------
 TEAM_SPACE_MAP: dict = {
     # Linear team name   →   Jira project key or display name
-    "Desktop":               "Desktop",
-    #"Web":                   "Core Team",
+    #"Desktop":               "Desktop",
+    "Web":                   "Core Team",
     #"Security": "Security",
     #"DevOps": "DevOps",
     #"Onboarding": "Onboarding"
@@ -87,6 +87,7 @@ USER_MAPPING_FILE = "user_mapping.csv"
 # Leave as None to fall back to name-based auto-detection.
 # ---------------------------------------------------------------------------
 STORY_POINTS_FIELD: str = "customfield_10104"
+SPRINT_FIELD:        str = "customfield_10020"
 
 DEFAULT_PRIORITY_MAP: dict = {
     "Urgent":      "Highest",
@@ -234,6 +235,7 @@ _FIELDS_FULL = """
     project      { id name state description url targetDate }
     team         { id name key }
     parent       { id identifier title }
+    cycle        { id name number startsAt endsAt }
 """
 
 # Safe fallback — identical to _FIELDS_FULL (kept for structural consistency).
@@ -248,6 +250,7 @@ _FIELDS_SAFE = """
     project      { id name state description url targetDate }
     team         { id name key }
     parent       { id identifier title }
+    cycle        { id name number startsAt endsAt }
 """
 
 # Fields fetched per-issue in the enrichment batch (history, comments, attachments, relations)
@@ -344,6 +347,43 @@ def linear_fetch_all_issues(api_key: str, team_id: str,
         print("    Retrying with safe field set…")
 
     return _paginate_issues(api_key, team_id, _build_issue_query(since_str, _FIELDS_SAFE))
+
+
+def linear_fetch_team_cycles(api_key: str, team_id: str) -> list:
+    """
+    Fetch all cycles for a team (including completed ones) with the IDs of
+    their member issues.  Linear's issue.cycle field only reflects *active*
+    cycles; this gives us full historical membership.
+    Returns a list of cycle dicts, each containing an 'issueIds' set.
+    """
+    template = (
+        "query($tid: String!, $cursor: String) {"
+        "  team(id: $tid) {"
+        "    cycles(first: 50, after: $cursor, orderBy: createdAt) {"
+        "      pageInfo { hasNextPage endCursor }"
+        "      nodes {"
+        "        id name number startsAt endsAt"
+        "        issues(first: 250) { nodes { id } }"
+        "      }"
+        "    }"
+        "  }"
+        "}"
+    )
+    cycles: list = []
+    cursor: Optional[str] = None
+    while True:
+        try:
+            data   = gql(api_key, template, {"tid": team_id, "cursor": cursor})
+            result = data["team"]["cycles"]
+        except Exception:
+            break
+        for node in result["nodes"]:
+            node["issueIds"] = {i["id"] for i in _nodes(node.get("issues"))}
+            cycles.append(node)
+        if not result["pageInfo"]["hasNextPage"]:
+            break
+        cursor = result["pageInfo"]["endCursor"]
+    return cycles
 
 
 def linear_fetch_project_issues(api_key: str, project_id: str) -> list:
@@ -454,6 +494,7 @@ _IMAGE_SPLIT_PATTERN = re.compile(r'(!\[[^\]]*\]\([^)]+\))')
 # ANSI terminal colours used in the preview table
 _C_GREEN  = "\033[92m"   # assignee/lead mapped to a Jira user
 _C_RED    = "\033[91m"   # assignee/lead present but NOT mapped — add to user_mapping.csv
+_C_CYAN   = "\033[96m"   # cycle / sprint name
 _C_RESET  = "\033[0m"
 _ANSI_RE  = re.compile(r'\033\[[0-9;]*m')
 
@@ -942,6 +983,70 @@ class JiraClient:
                                  "outwardIssue": {"key": outward_key},
                                  "inwardIssue":  {"key": inward_key}})
 
+    def get_boards_for_project(self, project_key: str) -> list:
+        """Return all Scrum/Kanban boards for a Jira project (Agile API)."""
+        url = f"{self.agile_base}/board"
+        headers = {"Authorization": self._auth, "Accept": "application/json"}
+        try:
+            resp = requests.get(url, headers=headers,
+                                params={"projectKeyOrId": project_key, "maxResults": 50},
+                                timeout=60)
+            return resp.json().get("values", []) if resp.status_code in (200, 201) else []
+        except Exception:
+            return []
+
+    def get_sprints_for_board(self, board_id: int) -> list:
+        """Return all sprints for a board (all states), paginating."""
+        url = f"{self.agile_base}/board/{board_id}/sprint"
+        headers = {"Authorization": self._auth, "Accept": "application/json"}
+        sprints: list = []
+        start = 0
+        while True:
+            try:
+                resp = requests.get(url, headers=headers,
+                                    params={"startAt": start, "maxResults": 50},
+                                    timeout=60)
+                if resp.status_code not in (200, 201):
+                    break
+                data  = resp.json()
+                batch = data.get("values", [])
+                sprints.extend(batch)
+                if data.get("isLast", True) or len(batch) < 50:
+                    break
+                start += len(batch)
+            except Exception:
+                break
+        return sprints
+
+    def create_sprint(self, name: str, board_id: int,
+                      start_date: Optional[str] = None,
+                      end_date:   Optional[str] = None) -> dict:
+        """Create a new sprint on a board and return the sprint object."""
+        url = f"{self.agile_base}/sprint"
+        headers = {"Authorization": self._auth,
+                   "Content-Type": "application/json",
+                   "Accept": "application/json"}
+        body: dict = {"name": name, "originBoardId": board_id}
+        if start_date:
+            body["startDate"] = start_date
+        if end_date:
+            body["endDate"] = end_date
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        if resp.status_code not in (200, 201):
+            raise Exception(f"create_sprint failed ({resp.status_code}): {resp.text[:200]}")
+        return resp.json()
+
+    def add_issue_to_sprint(self, sprint_id: int, issue_keys: list) -> None:
+        """Move issues into a sprint via the Agile API."""
+        url = f"{self.agile_base}/sprint/{sprint_id}/issue"
+        headers = {"Authorization": self._auth,
+                   "Content-Type": "application/json",
+                   "Accept": "application/json"}
+        resp = requests.post(url, headers=headers,
+                             json={"issues": issue_keys}, timeout=60)
+        if resp.status_code not in (200, 204):
+            raise Exception(f"add_issue_to_sprint failed ({resp.status_code}): {resp.text[:200]}")
+
     def move_to_backlog(self, issue_keys: list) -> None:
         if not issue_keys:
             return
@@ -1203,6 +1308,62 @@ def build_jira_fields(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cycle / Sprint helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cycle_label(cycle: dict) -> str:
+    """Return a display name for a Linear cycle (name or 'Cycle N')."""
+    name = (cycle.get("name") or "").strip()
+    return name if name else f"Cycle {cycle.get('number', '?')}"
+
+
+def ensure_sprint_map(jira: "JiraClient", project_key: str, issues: list) -> dict:
+    """
+    For every unique Linear cycle found in *issues*, ensure a matching Jira
+    sprint exists on the project's first board (creating it if necessary).
+    Returns {cycle_label_lower: sprint_id (int)}.
+    Returns {} if the project has no board or the Agile API is unavailable.
+    """
+    boards = jira.get_boards_for_project(project_key)
+    if not boards:
+        print(f"  · No Agile board found for [{project_key}] — sprint field will be skipped")
+        return {}
+    board_id = boards[0]["id"]
+
+    existing = {s["name"].lower(): s["id"]
+                for s in jira.get_sprints_for_board(board_id) if s.get("name")}
+
+    # Collect unique cycles needed
+    cycles_needed: dict = {}
+    for iss in issues:
+        cyc = iss.get("cycle")
+        if not cyc:
+            continue
+        label = _cycle_label(cyc)
+        if label.lower() not in cycles_needed:
+            cycles_needed[label.lower()] = cyc
+
+    sprint_map: dict = dict(existing)
+    created = 0
+    for label_lower, cyc in cycles_needed.items():
+        if label_lower in sprint_map:
+            continue
+        label = _cycle_label(cyc)
+        try:
+            sprint = jira.create_sprint(label, board_id,
+                                        cyc.get("startsAt"), cyc.get("endsAt"))
+            sprint_map[label_lower] = sprint["id"]
+            created += 1
+        except Exception as exc:
+            print(f"  WARN  Could not create sprint '{label}': {exc}")
+
+    matched = sum(1 for lbl in cycles_needed if lbl in existing)
+    print(f"  ✓ Sprint map: {matched} matched, {created} created"
+          f" ({len(cycles_needed)} cycle(s) in issues)")
+    return sprint_map
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Preview table
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1297,10 +1458,23 @@ def _preview_detail_line(entry: dict, user_map: dict, user_label_map: dict) -> s
     # State
     state_str = (iss.get("state") or {}).get("name") or "?"
 
+    # Cycle — highlighted in cyan, shown inline next to Pts
+    cycle = iss.get("cycle")
+    if cycle:
+        cycle_num  = cycle.get("number")
+        cycle_name = (cycle.get("name") or "").strip()
+        if cycle_name:
+            raw = f"Cycle {cycle_num}: {cycle_name}" if cycle_num is not None else cycle_name
+        else:
+            raw = f"Cycle {cycle_num}" if cycle_num is not None else "Cycle"
+        cycle_str = f"{_C_CYAN}{raw}{_C_RESET}"
+    else:
+        cycle_str = None
+
     parts = [
         f"Assignee: {assignee_str}",
         f"Labels: {labels_str}",
-        f"Pts: {pts_str}",
+        f"Pts: {pts_str}" + (f"   {cycle_str}" if cycle_str else ""),
         date_str,
         f"State: {state_str}",
     ]
@@ -1635,6 +1809,7 @@ def _create_one_issue(
     reporter_map:    dict,
     linear_key:      str,
     report:          dict,
+    sprint_map:      Optional[dict] = None,
 ) -> tuple:
     """
     Migrate a single Linear issue to Jira.
@@ -1672,20 +1847,38 @@ def _create_one_issue(
         save_mapping(mapping)
         print(f"  OK    {identifier}  →  {jira_key}  [{issue_type}]  |  {fields['summary'][:45]}")
 
+        # Description (may trigger image uploads — kept in its own try so failures
+        # don't block story-points or sprint assignment below)
         if issue_desc:
             desc_adf = upload_images_and_build_description(
                 issue_desc, jira_key, jira_issue_id, identifier, jira, linear_key)
         else:
             desc_adf = {"version": 1, "type": "doc", "content": []}
-        update_fields: dict = {"description": desc_adf}
+        try:
+            jira.update_issue(jira_key, {"description": desc_adf})
+        except Exception as upd_exc:
+            print(f"  WARN  {identifier}  description update failed: {upd_exc}")
+
+        # Story points — separate update so a description failure can't block it
         estimate = issue.get("estimate")
         if sp_field_id and estimate is not None:
             sp_val = int(estimate) if estimate == int(estimate) else float(estimate)
-            update_fields[sp_field_id] = sp_val
-        try:
-            jira.update_issue(jira_key, update_fields)
-        except Exception as upd_exc:
-            print(f"  WARN  {identifier}  update failed: {upd_exc}")
+            try:
+                jira.update_issue(jira_key, {sp_field_id: sp_val})
+            except Exception as sp_exc:
+                print(f"  WARN  {identifier}  story points update failed: {sp_exc}")
+
+        # Sprint — add to Jira sprint via Agile API
+        if sprint_map:
+            cyc = issue.get("cycle")
+            if cyc:
+                label = _cycle_label(cyc)
+                sprint_id = sprint_map.get(label.lower())
+                if sprint_id:
+                    try:
+                        jira.add_issue_to_sprint(sprint_id, [jira_key])
+                    except Exception as spr_exc:
+                        print(f"  WARN  {identifier}  sprint assignment failed: {spr_exc}")
 
         return True, False, False
     except Exception as exc:
@@ -1708,6 +1901,7 @@ def _run_issue_phase(
     reporter_map:    dict,
     linear_key:      str,
     report:          dict,
+    sprint_map:      Optional[dict] = None,
 ) -> None:
     """Print a header for `label`, iterate `subset`, delegate each to _create_one_issue."""
     print(f"\n  ── {label}: {len(subset)} issue(s) ──")
@@ -1719,6 +1913,7 @@ def _run_issue_phase(
             issue, project_key, epic_map, jira, mapping,
             priority_map, sp_field_id, epic_name_field,
             assignee_map, reporter_map, linear_key, report,
+            sprint_map=sprint_map,
         )
         created += c; skipped += s; failed += f
     print(f"  {label} — created: {created}  skipped: {skipped}  failed: {failed}")
@@ -1726,12 +1921,14 @@ def _run_issue_phase(
 
 def _phase_issues(label, issues, filter_fn, project_key, epic_map, jira, mapping,
                   priority_map, sp_field_id, epic_name_field,
-                  assignee_map, reporter_map, linear_key, report):
+                  assignee_map, reporter_map, linear_key, report,
+                  sprint_map=None):
     _run_issue_phase(
         label, [i for i in issues if filter_fn(i)],
         project_key, epic_map, jira, mapping,
         priority_map, sp_field_id, epic_name_field,
         assignee_map, reporter_map, linear_key, report,
+        sprint_map=sprint_map,
     )
 
 
@@ -2298,6 +2495,9 @@ def main() -> None:
     else:
         print("\n  No labels found on fetched issues — label filter skipped.")
 
+    # Build tname → team_id lookup for cycle fetch below
+    _team_id_by_name = {t["name"]: t["id"] for t in mapped_teams}
+
     # ── Phase C: apply label filter + enrich ──────────────────────────────────
     for tname, issues in all_raw_by_team.items():
         filtered = []
@@ -2315,6 +2515,34 @@ def main() -> None:
         if n_label_filtered:
             print(f"  [{tname}] {n_label_filtered} issue(s) removed by label filter  "
                   f"({len(filtered)} remaining)")
+
+        # Backfill cycle data from the team's cycle list.
+        # Linear's issue.cycle API field is null for completed cycles, so we
+        # fetch all cycles (including completed) and patch any issue missing it.
+        team_id = _team_id_by_name.get(tname)
+        if team_id:
+            try:
+                all_cycles = linear_fetch_team_cycles(linear_key, team_id)
+                # Build issue_id → cycle dict (strip issueIds before attaching)
+                cycle_by_issue: dict = {}
+                for cyc in all_cycles:
+                    issue_ids = cyc.pop("issueIds", set())
+                    slim = {k: cyc[k] for k in ("id", "name", "number", "startsAt", "endsAt")
+                            if k in cyc}
+                    for iid in issue_ids:
+                        cycle_by_issue.setdefault(iid, slim)
+                patched = 0
+                for iss in filtered:
+                    if not iss.get("cycle"):
+                        cyc = cycle_by_issue.get(iss["id"])
+                        if cyc:
+                            iss["cycle"] = cyc
+                            patched += 1
+                if all_cycles:
+                    print(f"  [{tname}] {len(all_cycles)} cycle(s) fetched"
+                          + (f", {patched} issue(s) backfilled with cycle data" if patched else ""))
+            except Exception as exc:
+                print(f"  [{tname}] Warning: could not fetch cycles — {exc}")
 
         # Enrich with history, comments, attachments, relations
         linear_enrich_with_history(linear_key, filtered)
@@ -2438,11 +2666,15 @@ def main() -> None:
             user_map, linear_key, report,
         )
 
+        # Build sprint map: find/create Jira sprints for each Linear cycle
+        sprint_map = ensure_sprint_map(jira, project_key, issues)
+
         # Issues — one phase per type
         _issue_args = (
             project_key, epic_map, jira, mapping,
             DEFAULT_PRIORITY_MAP, sp_field_id, epic_name_field,
             user_map, user_map, linear_key, report,
+            sprint_map,
         )
         phase_create_bugs(issues,             *_issue_args)
         phase_create_feature_requests(issues, *_issue_args)
