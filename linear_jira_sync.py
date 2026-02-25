@@ -21,6 +21,8 @@ Field mapping:
 
 Usage:
     python linear_jira_sync.py
+Tests:
+    python -m pytest test_linear_jira_sync.py -v
 """
 
 import sys
